@@ -2,6 +2,9 @@
 """
 mysh - Shell Simulation with Integrated OS Concepts
 Deliverable 1: Basic Shell Implementation and Process Management
+Deliverable 2: Process Scheduling (see scheduler.py and the `sched` built-in)
+
+MSCS-630 Advanced Operating Systems
 
 What this deliverable covers
   * A read-parse-execute loop that accepts user commands.
@@ -11,6 +14,9 @@ What this deliverable covers
     os.fork(), os.execvp(), os.waitpid() and os._exit().
   * Foreground and background execution ("&"), a job table that tracks
     the state of every child, and job control (jobs, fg, bg, Ctrl+Z, Ctrl+C).
+  * Deliverable 2: a `sched` built-in that runs a simulated workload through
+    Round-Robin (configurable time slice) and preemptive Priority scheduling
+    and reports waiting, turnaround and response time.
 
 Run it with:   python3 mysh.py
 It needs a Unix-like OS (Linux or macOS) because os.fork() does not exist
@@ -24,6 +30,8 @@ import signal
 import stat
 import sys
 import time
+
+from scheduler import SchedShell
 
 try:
     import readline  # noqa: F401  arrow-key history and line editing
@@ -109,7 +117,9 @@ class Shell:
             "rm": self.b_rm, "touch": self.b_touch, "kill": self.b_kill,
             "jobs": self.b_jobs, "fg": self.b_fg, "bg": self.b_bg,
             "help": self.b_help, "trace": self.b_trace,
+            "sched": self.b_sched,
         }
+        self.sched = SchedShell(self.err)   # Deliverable 2 scheduler
 
         if self.interactive:
             self._init_job_control()
@@ -160,7 +170,7 @@ class Shell:
 
     # ------------------------------------------------------------- main loop
     def run(self):
-        print(color("mysh - MSCS-630 shell simulation (Deliverable 1). "
+        print(color("mysh - MSCS-630 shell simulation (Deliverables 1-2). "
                     "Type 'help' for commands.", CYAN))
         while True:
             self.reap_jobs()
@@ -464,12 +474,17 @@ class Shell:
             ("fg [%job]", "bring a job to the foreground"),
             ("bg [%job]", "resume a stopped job in the background"),
             ("trace on|off", "show fork/exec/wait events as they happen"),
+            ("sched help", "process scheduling (Round-Robin, Priority)"),
             ("exit [n]", "leave the shell"),
             ("cmd &", "run any command in the background"),
         ]
         for usage, desc in rows:
             print(f"  {usage:<24} {desc}")
         return 0
+
+    def b_sched(self, args):
+        """Deliverable 2: simulated process scheduling."""
+        return self.sched.run(args)
 
     def b_trace(self, args):
         if args and args[0] in ("on", "off"):
