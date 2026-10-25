@@ -1,6 +1,7 @@
-# mysh: Shell Simulation (Deliverables 1-3)
+# mysh: Shell Simulation (Deliverables 1-4)
 
 MSCS-630 Advanced Operating Systems, University of the Cumberlands
+Fortunato Hernandez
 
 A Unix-like shell written in Python.
 
@@ -12,6 +13,8 @@ A Unix-like shell written in Python.
 - **Deliverable 3:** memory management with paging (fixed-size frames, page
   tables, page faults, FIFO and LRU replacement) and process synchronization
   (mutex, counting semaphores, a race-condition demo and Producer-Consumer).
+- **Deliverable 4:** one integrated shell with pipes (`cmd1 | cmd2 | cmd3`), user
+  login with admin and standard roles, and read/write/execute file permissions.
 
 ## Running
 
@@ -19,7 +22,17 @@ A Unix-like shell written in Python.
 python3 mysh.py
 ```
 
-Keep `mysh.py`, `scheduler.py`, `memory.py` and `sync.py` in the same folder. Requires Python 3.8+ on Linux or macOS (`os.fork()` is not available on Windows).
+You log in first. Demo accounts:
+
+| Username | Password | Role |
+|---|---|---|
+| admin | admin123 | admin |
+| fortunato | mysh2026 | standard |
+| maria | maria2026 | standard |
+
+Passwords are stored as salted PBKDF2-SHA256 hashes in `.mysh_users.json`.
+
+Keep `mysh.py`, `scheduler.py`, `memory.py`, `sync.py` and `security.py` in the same folder. Requires Python 3.8+ on Linux or macOS (`os.fork()` is not available on Windows).
 No third-party packages are needed.
 
 ## Deliverable 1 features
@@ -53,6 +66,10 @@ No third-party packages are needed.
 | `sched ...` | Process scheduling (see below) |
 | `mem ...` | Paging and page replacement (see below) |
 | `sync ...` | Mutex, semaphores, Producer-Consumer (see below) |
+| `cmd1 \| cmd2 \| ...` | Pipe each command's output into the next |
+| `whoami`, `su USER`, `logout` | Identity and switching users |
+| `chmod MODE FILE` | Change permissions (owner or admin) |
+| `chown USER FILE`, `users`, `useradd`, `audit` | Admin only |
 | `help` | List commands |
 | `exit [n]` | Leave the shell |
 | `command &` | Run any program in the background |
@@ -151,4 +168,40 @@ mem demo lru
 mem compare
 sync race
 sync pc
+```
+
+## Deliverable 4: pipes
+
+`cmd1 | cmd2 | cmd3` forks one child per stage. The shell creates a pipe with
+`os.pipe()` between each pair of stages, and each child uses `os.dup2()` to
+connect its stdin to the previous pipe and its stdout to the next one. All
+stages share one process group, so the whole pipeline is one job (Ctrl+Z,
+`jobs`, `fg`, `bg` and `kill %n` work on it). Built-ins such as `ls`, `cat`,
+`sched`, `mem` and `sync` can be pipeline stages too.
+
+```
+ls | grep txt
+cat system/app.log | grep error | sort -r
+sched compare | grep -i robin
+```
+
+## Deliverable 4: security
+
+- **Authentication:** username and password at startup (3 tries), `su` and `logout`.
+- **Roles:** admin (group admin) and standard (group users). Admin-only commands:
+  `users`, `useradd`, `chown`, `audit`.
+- **File permissions:** files in the workspace (the folder mysh starts in) have an
+  owner, group and mode like `rw-r--r--`, stored in `.mysh_meta.json`. Before
+  every protected action the shell checks read, write or execute for the current
+  user (owner, group, or others bits). Admin can read and write anything, but can
+  only execute a file with an x bit. Files mysh did not create are treated as
+  system files owned by admin (`rw-r--r--`).
+- On first run mysh creates demo files: `system/config.txt`, `system/app.log`,
+  `system/secret.txt` (admin only) and `scripts/report.sh` (not executable yet).
+
+```
+cat system/config.txt        # allowed for everyone (r--)
+rm system/config.txt         # denied for standard users (no w)
+cat system/secret.txt        # denied for standard users (rw-------)
+chmod +x scripts/report.sh   # owner or admin only
 ```

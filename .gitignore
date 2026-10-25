@@ -1,3 +1,12 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# created by mysh at runtime (accounts, permissions, demo files)
+.mysh_users.json
+.mysh_meta.json
+system/
+scripts/
+project/
+notes.txt
+maria.txt

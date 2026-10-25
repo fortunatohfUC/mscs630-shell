@@ -5,11 +5,13 @@ Deliverable 1: Basic Shell Implementation and Process Management
 Deliverable 2: Process Scheduling (see scheduler.py and the `sched` built-in)
 Deliverable 3: Memory Management and Process Synchronization
                (see memory.py / `mem` and sync.py / `sync`)
+Deliverable 4: Integration and Security - pipes, user login, file permissions
+               (see security.py)
 
 MSCS-630 Advanced Operating Systems
 
-What this deliverable covers
-  * A read-parse-execute loop that accepts user commands.
+What the shell covers
+  * A read-parse-execute loop that accepts user commands, after a login.
   * Built-in commands: cd, pwd, exit, echo, clear, ls, cat, mkdir, rmdir,
     rm, touch, kill (plus jobs, fg, bg, help, trace).
   * External programs are started with the real Unix system calls
@@ -23,13 +25,18 @@ What this deliverable covers
     frames, page faults and FIFO / LRU replacement, and a `sync` built-in
     with a mutex, counting semaphores, a race-condition demo and the
     Producer-Consumer problem.
+  * Deliverable 4: pipelines of any length (cmd1 | cmd2 | cmd3) built with
+    os.pipe() and os.dup2(); user authentication with admin and standard
+    roles; read/write/execute permission checks on every protected action.
 
 Run it with:   python3 mysh.py
 It needs a Unix-like OS (Linux or macOS) because os.fork() does not exist
 on Windows. No third-party packages are required.
 """
 
+import getpass
 import os
+import pwd
 import shlex
 import shutil
 import signal
@@ -37,8 +44,12 @@ import stat
 import sys
 import time
 
-from scheduler import SchedShell
+import memory
+import scheduler
+import sync
 from memory import MemShell
+from scheduler import SchedShell
+from security import Security
 from sync import SyncShell
 
 try:
@@ -64,6 +75,14 @@ def color(text, code):
     return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
 
 
+def disable_color():
+    """Used in a pipeline stage whose output goes into a pipe, not a screen."""
+    global USE_COLOR
+    USE_COLOR = False
+    for module in (scheduler, memory, sync):
+        module.USE_COLOR = False
+
+
 RED, GREEN, YELLOW, BLUE, CYAN, DIM = "31", "32", "33", "1;34", "36", "2"
 
 # Signals the shell itself ignores so that Ctrl+Z, background reads/writes
@@ -78,27 +97,36 @@ CHILD_RESET_SIGNALS = (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP,
                        signal.SIGTTIN, signal.SIGTTOU, signal.SIGCHLD,
                        signal.SIGPIPE)
 
-# Operators that later deliverables will add (pipes, redirection, lists).
-UNSUPPORTED_OPERATORS = {"|", "||", "&&", ";", "<", ">", ">>", "(", ")"}
+# Operators this shell does not support (pipes "|" are supported).
+UNSUPPORTED_OPERATORS = {"||", "&&", ";", "<", ">", ">>", "(", ")"}
 
 # Built-ins that can safely run inside a forked child when followed by "&".
 FORKABLE_BUILTINS = {"echo", "pwd", "ls", "cat"}
+
+# Built-ins that change the shell's own state. Inside a pipeline they would
+# run in a child process and the change would be lost, so they are refused.
+STATEFUL_BUILTINS = {"cd", "exit", "jobs", "fg", "bg", "su", "logout", "trace",
+                     "clear", "kill", "useradd"}
 
 
 # --------------------------------------------------------------------------
 # Job table
 # --------------------------------------------------------------------------
 class Job:
-    """One entry in the shell's job table (one child process for now)."""
+    """One entry in the job table: a single process, or every process of a
+    pipeline. All processes of a job share one process group."""
 
-    def __init__(self, job_id, pid, command, background):
+    def __init__(self, job_id, pids, command, background):
         self.id = job_id
-        self.pid = pid
-        self.pgid = pid              # each job gets its own process group
+        self.pids = list(pids)
+        self.pid = self.pids[0]
+        self.pgid = self.pids[0]     # each job gets its own process group
+        self.alive = set(self.pids)  # processes not reaped yet
         self.command = command       # command text without a trailing "&"
         self.background = background
         self.status = "Running"      # Running | Stopped | Done | Exit N | ...
         self.returncode = None
+        self.final = None            # (status text, code) of the last stage
         self.finished = False
         self.changed = False         # set when the state changes in the background
         self.started = time.time()
@@ -111,7 +139,7 @@ class Shell:
     def __init__(self):
         self.jobs = {}               # job_id -> Job
         self.last_status = 0         # exit status of the last command ($?)
-        self.trace = False           # print fork/exec/wait events when True
+        self.trace = False           # print fork/exec/wait/pipe events when True
         self.warned_stopped = False  # "There are stopped jobs" warning given
         self.interactive = sys.stdin.isatty()
         self.tty_fd = sys.stdin.fileno()
@@ -126,10 +154,14 @@ class Shell:
             "jobs": self.b_jobs, "fg": self.b_fg, "bg": self.b_bg,
             "help": self.b_help, "trace": self.b_trace,
             "sched": self.b_sched, "mem": self.b_mem, "sync": self.b_sync,
+            "su": self.b_su, "logout": self.b_logout,
         }
         self.sched = SchedShell(self.err)   # Deliverable 2 scheduler
         self.mem = MemShell(self.err)       # Deliverable 3 paging
         self.sync = SyncShell(self.err)     # Deliverable 3 synchronization
+        self.sec = Security(os.getcwd(), self.err)   # Deliverable 4 security
+        for name in ("whoami", "users", "useradd", "chmod", "chown", "audit"):
+            self.builtins[name] = getattr(self.sec, "b_" + name)
 
         if self.interactive:
             self._init_job_control()
@@ -171,17 +203,22 @@ class Shell:
         home = os.path.expanduser("~")
         if cwd == home or cwd.startswith(home + os.sep):
             cwd = "~" + cwd[len(home):]
+        user = self.sec.user
+        mark = "#" if user.is_admin else "$"       # like root's prompt
         if not USE_COLOR:
-            return f"mysh:{cwd}$ "
+            return f"{user.name}@mysh:{cwd}{mark} "
         # \001 and \002 tell readline the color codes take up no width.
         s, e = ("\001", "\002") if HAVE_READLINE else ("", "")
-        return (f"{s}\033[1;32m{e}mysh{s}\033[0m{e}:"
-                f"{s}\033[1;34m{e}{cwd}{s}\033[0m{e}$ ")
+        ucol = "1;31" if user.is_admin else "1;32"
+        return (f"{s}\033[{ucol}m{e}{user.name}@mysh{s}\033[0m{e}:"
+                f"{s}\033[1;34m{e}{cwd}{s}\033[0m{e}{mark} ")
 
     # ------------------------------------------------------------- main loop
     def run(self):
-        print(color("mysh - MSCS-630 shell simulation (Deliverables 1-3). "
+        print(color("mysh - MSCS-630 shell simulation (Deliverables 1-4). "
                     "Type 'help' for commands.", CYAN))
+        if not self.sec.login():
+            sys.exit(1)
         while True:
             self.reap_jobs()
             self.report_job_changes()
@@ -201,7 +238,8 @@ class Shell:
         """Split a command line into words, honoring quotes.
 
         punctuation_chars=True makes '&', '|', ';', '<' and '>' separate
-        tokens, so "sleep 5&" is read the same way as "sleep 5 &".
+        tokens, so "sleep 5&" is read the same way as "sleep 5 &" and
+        "ls|grep txt" the same as "ls | grep txt".
         """
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -235,25 +273,49 @@ class Shell:
         for tok in tokens:
             if tok == "&" or tok in UNSUPPORTED_OPERATORS:
                 self.last_status = self.err(
-                    f"unsupported operator '{tok}' (pipes and redirection "
-                    "are planned for a later deliverable)", 2)
+                    f"unsupported operator '{tok}' (this shell supports pipes '|' "
+                    "and '&', but not redirection or command lists)", 2)
                 return
 
-        argv = [self.expand(t) for t in tokens]
-        name, args = argv[0], argv[1:]
+        # Split into pipeline stages on "|".
+        stages, current = [], []
+        for tok in tokens:
+            if tok == "|":
+                stages.append(current)
+                current = []
+            else:
+                current.append(tok)
+        stages.append(current)
+        if any(not s for s in stages):
+            self.last_status = self.err("syntax error near unexpected token '|'", 2)
+            return
+
+        argvs = [[self.expand(t) for t in s] for s in stages]
         cmdline = " ".join(tokens)
-        if name != "exit":
+        if argvs[0][0] != "exit":
             self.warned_stopped = False
 
+        if len(argvs) > 1:
+            for argv in argvs:
+                if argv[0] in STATEFUL_BUILTINS:
+                    self.last_status = self.err(
+                        f"{argv[0]}: cannot be used in a pipeline "
+                        "(it changes the shell itself)", 2)
+                    return
+            self.launch_pipeline(argvs, background, cmdline)
+            return
+
+        argv = argvs[0]
+        name, args = argv[0], argv[1:]
         if name in self.builtins:
             if background and name in FORKABLE_BUILTINS:
-                self.launch(argv, True, cmdline, builtin=True)
+                self.launch_pipeline([argv], True, cmdline)
             else:
                 if background:
                     self.err(f"{name}: shell built-in runs in the foreground")
                 self.last_status = self.builtins[name](args)
         else:
-            self.launch(argv, background, cmdline)
+            self.launch_pipeline([argv], background, cmdline)
 
     # ------------------------------------------------------ process creation
     def resolve_program(self, program):
@@ -273,47 +335,79 @@ class Shell:
             return f"{program}: command not found"
         return None
 
-    def launch(self, argv, background, cmdline, builtin=False):
-        """Create a child with fork() and run the command in it."""
-        if not builtin:
-            problem = self.resolve_program(argv[0])
-            if problem:
-                code = 127 if "not found" in problem or "No such" in problem else 126
-                self.last_status = self.err(problem, code)
+    def check_stage(self, argv, pipeline):
+        """Validate one stage before anything is forked. Returns True if OK."""
+        name = argv[0]
+        if name in self.builtins:
+            return True
+        problem = self.resolve_program(name)
+        if problem:
+            code = 127 if "not found" in problem or "No such" in problem else 126
+            note = " (pipeline not started)" if pipeline else ""
+            self.last_status = self.err(problem + note, code)
+            return False
+        # mysh's own execute permission for scripts inside the workspace
+        if "/" in name and not self.sec.require("exec", name, "x"):
+            self.last_status = 126
+            return False
+        # An outside program opens its file arguments itself, so mysh checks
+        # read access for any workspace file it was given (grep x secret.txt).
+        for arg in argv[1:]:
+            if os.path.isfile(arg) and not self.sec.require(name, arg, "r"):
+                self.last_status = 126
+                return False
+        return True
+
+    def launch_pipeline(self, stages, background, cmdline):
+        """Fork one child per stage and connect them with pipes.
+
+        Stage i writes to pipe i and stage i+1 reads from it. A single
+        command is just a pipeline with one stage and no pipes.
+        """
+        n = len(stages)
+        for argv in stages:
+            if not self.check_stage(argv, n > 1):
                 return
 
         sys.stdout.flush()
         sys.stderr.flush()
-        try:
-            pid = os.fork()
-        except OSError as e:
-            self.last_status = self.err(f"fork failed: {e.strerror}")
+        pipes = [os.pipe() for _ in range(n - 1)]
+        for i, (r, w) in enumerate(pipes, 1):
+            self.tmsg(f"pipe() #{i}: read end fd {r}, write end fd {w} "
+                      f"(stage {i} -> stage {i + 1})")
+        pids, pgid = [], 0
+        for i, argv in enumerate(stages):
+            try:
+                pid = os.fork()
+            except OSError as e:
+                self.last_status = self.err(f"fork failed: {e.strerror}")
+                break
+            if pid == 0:
+                self._child(argv, i, n, pipes, background, pgid)   # never returns
+            if not pgid:
+                pgid = pid
+            try:
+                os.setpgid(pid, pgid)  # done in both processes to avoid a race
+            except OSError:
+                pass
+            pids.append(pid)
+            if n == 1:
+                self.tmsg(f"fork(): shell pid {os.getpid()} created child pid {pid} "
+                          f"in process group {pid}")
+            else:
+                src = "terminal" if i == 0 else f"pipe #{i}"
+                dst = "terminal" if i == n - 1 else f"pipe #{i + 1}"
+                self.tmsg(f"fork(): stage {i + 1} '{' '.join(argv)}' is pid {pid} "
+                          f"(group {pgid}), stdin <- {src}, stdout -> {dst}")
+        # The shell keeps no pipe ends open; otherwise the last reader would
+        # never see end-of-file.
+        for r, w in pipes:
+            os.close(r)
+            os.close(w)
+        if not pids:
             return
 
-        if pid == 0:
-            # ---------------- child process ----------------
-            self._setup_child(background)
-            if builtin:
-                status = self.builtins[argv[0]](argv[1:])
-                sys.stdout.flush()
-                os._exit(status)
-            self.tmsg(f"child {os.getpid()}: execvp('{argv[0]}', {argv})")
-            try:
-                os.execvp(argv[0], argv)
-            except OSError as e:
-                # Only reached if exec fails; the child must not return
-                # to the shell loop, so it exits right away.
-                self.err(f"{argv[0]}: {e.strerror}")
-                os._exit(126)
-
-        # ---------------- parent (the shell) ----------------
-        try:
-            os.setpgid(pid, pid)  # done in both processes to avoid a race
-        except OSError:
-            pass
-        job = self.add_job(pid, cmdline, background)
-        self.tmsg(f"fork(): shell pid {os.getpid()} created child pid {pid} "
-                  f"in process group {pid}")
+        job = self.add_job(pids, cmdline, background)
         if background:
             self.tmsg(f"background job [{job.id}]: shell does not wait, "
                       "returns to the prompt")
@@ -322,36 +416,63 @@ class Shell:
                 # time; a short pause keeps the child's trace line from
                 # landing on top of the next prompt.
                 time.sleep(0.05)
-            print(f"[{job.id}] {pid}")
+            print(f"[{job.id}] {' '.join(map(str, pids))}")
             self.last_status = 0
         else:
             self.wait_foreground(job)
 
-    def _setup_child(self, background):
-        """Runs in the child right after fork(), before exec()."""
-        pid = os.getpid()
+    def _child(self, argv, i, n, pipes, background, pgid):
+        """Runs in a child right after fork(): wire up the pipes, then exec."""
         try:
-            os.setpgid(0, 0)  # new process group with pgid == pid
+            os.setpgid(0, pgid)      # pgid 0 = start a new group with my pid
         except OSError:
             pass
         if self.interactive and not background:
             try:
-                os.tcsetpgrp(self.tty_fd, pid)  # child owns the terminal
+                os.tcsetpgrp(self.tty_fd, os.getpgrp())  # job owns the terminal
             except OSError:
                 pass
         for sig in CHILD_RESET_SIGNALS:
             signal.signal(sig, signal.SIG_DFL)
+        if i > 0:
+            os.dup2(pipes[i - 1][0], 0)   # stdin  <- previous stage
+        if i < n - 1:
+            os.dup2(pipes[i][1], 1)       # stdout -> next stage
+        for r, w in pipes:                # close every original pipe end
+            os.close(r)
+            os.close(w)
+        if not os.isatty(1):
+            disable_color()
+
+        name = argv[0]
+        if name in self.builtins:
+            try:
+                status = self.builtins[name](argv[1:])
+                sys.stdout.flush()
+            except SystemExit as e:
+                status = e.code if isinstance(e.code, int) else 0
+            except BrokenPipeError:
+                status = 0
+            os._exit(status if isinstance(status, int) else 0)
+        self.tmsg(f"child {os.getpid()}: execvp('{name}', {argv})")
+        try:
+            os.execvp(name, argv)
+        except OSError as e:
+            # Only reached if exec fails; the child must not return
+            # to the shell loop, so it exits right away.
+            self.err(f"{name}: {e.strerror}")
+            os._exit(126)
 
     # ------------------------------------------------------------ job table
-    def add_job(self, pid, command, background):
+    def add_job(self, pids, command, background):
         job_id = max(self.jobs, default=0) + 1
-        job = Job(job_id, pid, command, background)
+        job = Job(job_id, pids, command, background)
         self.jobs[job_id] = job
         return job
 
     def find_job_by_pid(self, pid):
         for job in self.jobs.values():
-            if job.pid == pid:
+            if pid in job.pids:
                 return job
         return None
 
@@ -369,23 +490,32 @@ class Shell:
         except ValueError:
             return None
 
-    def apply_status(self, job, status):
-        """Translate a raw waitpid() status into the job's state."""
+    def apply_status(self, job, pid, status):
+        """Translate a raw waitpid() status for one process into job state.
+
+        A pipeline is finished when every stage has exited, and like bash its
+        exit status is the exit status of the last stage.
+        """
         if os.WIFSTOPPED(status):
             job.status = "Stopped"
-        elif os.WIFCONTINUED(status):
+            return
+        if os.WIFCONTINUED(status):
             job.status = "Running"
-        elif os.WIFEXITED(status):
+            return
+        if os.WIFEXITED(status):
             code = os.WEXITSTATUS(status)
-            job.returncode = code
-            job.status = "Done" if code == 0 else f"Exit {code}"
-            job.finished = True
-        elif os.WIFSIGNALED(status):
+            result = ("Done" if code == 0 else f"Exit {code}", code)
+        else:  # WIFSIGNALED
             sig = os.WTERMSIG(status)
-            job.returncode = 128 + sig
             names = {signal.SIGTERM: "Terminated", signal.SIGKILL: "Killed",
-                     signal.SIGINT: "Interrupt", signal.SIGHUP: "Hangup"}
-            job.status = names.get(sig, signal.Signals(sig).name)
+                     signal.SIGINT: "Interrupt", signal.SIGHUP: "Hangup",
+                     signal.SIGPIPE: "Broken pipe"}
+            result = (names.get(sig, signal.Signals(sig).name), 128 + sig)
+        job.alive.discard(pid)
+        if pid == job.pids[-1]:
+            job.final = result
+        if not job.alive:
+            job.status, job.returncode = job.final or result
             job.finished = True
 
     def reap_jobs(self):
@@ -403,8 +533,10 @@ class Shell:
                 break  # children exist, but none changed state
             job = self.find_job_by_pid(pid)
             if job:
-                self.apply_status(job, status)
-                job.changed = True
+                before = job.status
+                self.apply_status(job, pid, status)
+                if job.status != before or job.finished:
+                    job.changed = True
                 self.tmsg(f"waitpid(-1, WNOHANG) reaped pid {pid}: {job.status}")
 
     def report_job_changes(self):
@@ -424,8 +556,8 @@ class Shell:
         return f"[{job.id}]{mark}  {job.pid:<7} {job.status:<11} {cmd}"
 
     def wait_foreground(self, job, send_cont=False):
-        """Give the job the terminal and block in waitpid() until it exits
-        or is stopped (WUNTRACED catches Ctrl+Z)."""
+        """Give the job the terminal and block in waitpid() until every
+        process exits or the job is stopped (WUNTRACED catches Ctrl+Z)."""
         if self.interactive:
             try:
                 os.tcsetpgrp(self.tty_fd, job.pgid)
@@ -436,12 +568,20 @@ class Shell:
                 os.killpg(job.pgid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
-        self.tmsg(f"foreground job: shell blocks in waitpid({job.pid}, WUNTRACED)")
+        target = job.pid if len(job.pids) == 1 else -job.pgid
+        self.tmsg(f"foreground job: shell blocks in waitpid({target}, WUNTRACED)")
         try:
-            _, status = os.waitpid(job.pid, os.WUNTRACED)
-            self.apply_status(job, status)
-        except ChildProcessError:
-            job.status, job.finished, job.returncode = "Done", True, 0
+            while job.alive:
+                try:
+                    pid, status = os.waitpid(target, os.WUNTRACED)
+                except ChildProcessError:
+                    job.alive.clear()
+                    job.status, job.returncode = job.final or ("Done", 0)
+                    job.finished = True
+                    break
+                self.apply_status(job, pid, status)
+                if job.status == "Stopped":
+                    break
         finally:
             if self.interactive:
                 # Take the terminal back and restore its settings, in case
@@ -451,7 +591,7 @@ class Shell:
                     termios.tcsetattr(self.tty_fd, termios.TCSADRAIN,
                                       self.shell_tmodes)
 
-        self.tmsg(f"waitpid({job.pid}) returned: {job.status}")
+        self.tmsg(f"waitpid({target}) returned: {job.status}")
         if job.status == "Stopped":
             job.background = True
             print()
@@ -460,7 +600,7 @@ class Shell:
         else:
             if job.status in ("Interrupt",):
                 print()
-            elif job.finished and job.status not in ("Done",) \
+            elif job.finished and job.status not in ("Done", "Broken pipe") \
                     and not job.status.startswith("Exit"):
                 print(job.status)
             self.last_status = job.returncode or 0
@@ -474,7 +614,7 @@ class Shell:
             ("echo [-n] [text]", "print text"),
             ("clear", "clear the screen"),
             ("ls [-a] [-l] [path..]", "list directory contents"),
-            ("cat file..", "show file contents"),
+            ("cat [file..]", "show file contents (reads a pipe if no file)"),
             ("mkdir [-p] dir..", "create directories"),
             ("rmdir dir..", "remove empty directories"),
             ("rm [-r] [-f] file..", "remove files (or trees with -r)"),
@@ -483,10 +623,18 @@ class Shell:
             ("jobs", "list background and stopped jobs"),
             ("fg [%job]", "bring a job to the foreground"),
             ("bg [%job]", "resume a stopped job in the background"),
-            ("trace on|off", "show fork/exec/wait events as they happen"),
+            ("trace on|off", "show fork/exec/wait/pipe events as they happen"),
             ("sched help", "process scheduling (Round-Robin, Priority)"),
             ("mem help", "paging, page faults, FIFO / LRU replacement"),
             ("sync help", "mutex, semaphores, Producer-Consumer"),
+            ("cmd1 | cmd2 | ...", "pipe each command's output into the next"),
+            ("whoami", "show the logged-in user, role and group"),
+            ("chmod MODE FILE", "change permissions (owner or admin): 600, +x"),
+            ("chown USER FILE", "change a file's owner (admin only)"),
+            ("users / useradd", "list or add users (admin only)"),
+            ("audit", "show denied actions and logins (admin only)"),
+            ("su USER", "switch to another user (asks for the password)"),
+            ("logout", "log out and return to the login prompt"),
             ("exit [n]", "leave the shell"),
             ("cmd &", "run any command in the background"),
         ]
@@ -516,6 +664,42 @@ class Shell:
             return 0
         return self.err("trace: usage: trace on|off", 2)
 
+    # ------------------------------------------------- Deliverable 4: users
+    def b_su(self, args):
+        if len(args) != 1:
+            return self.err("su: usage: su USER", 2)
+        try:
+            password = getpass.getpass("password: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        user = self.sec.verify(args[0], password)
+        if user is None:
+            self.sec.audit("su", args[0], "FAILED")
+            time.sleep(1)
+            return self.err("su: authentication failure")
+        self.sec.user = user
+        os.environ["MYSH_USER"] = user.name
+        self.sec.audit("su", user.name, "ok")
+        print(f"now logged in as {user.name} (role: {user.role}, group: {user.group})")
+        return 0
+
+    def b_logout(self, args):
+        self.reap_jobs()
+        for job in self.jobs.values():   # a user's jobs end with the session
+            try:
+                os.killpg(job.pgid, signal.SIGHUP)
+                os.killpg(job.pgid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        print(f"{self.sec.user.name} logged out")
+        self.sec.audit("logout", "-", "ok")
+        os.chdir(self.sec.root)
+        if not self.sec.login(banner=False):
+            sys.exit(1)
+        return 0
+
+    # ------------------------------------------------- file system built-ins
     def b_cd(self, args):
         if len(args) > 1:
             return self.err("cd: too many arguments")
@@ -525,6 +709,8 @@ class Shell:
             if not target:
                 return self.err("cd: OLDPWD not set")
             print(target)
+        if os.path.isdir(target) and not self.sec.require("cd", target, "x"):
+            return 1
         try:
             old = os.getcwd()
         except FileNotFoundError:
@@ -586,6 +772,9 @@ class Shell:
                 status = self.err(f"ls: cannot access '{path}': Permission denied", 2)
                 continue
             if stat.S_ISDIR(st.st_mode):
+                if not self.sec.require("ls", path, "r"):
+                    status = 2
+                    continue
                 try:
                     names = sorted(os.listdir(path), key=lambda n: n.lower().lstrip("."))
                 except PermissionError:
@@ -608,7 +797,9 @@ class Shell:
     def _styled_name(self, name, full):
         if os.path.isdir(full):
             return color(name, BLUE)
-        if os.access(full, os.X_OK):
+        cols = self.sec.ls_columns(full)
+        executable = ("x" in cols[0]) if cols else os.access(full, os.X_OK)
+        if executable:
             return color(name, "1;32")
         return name
 
@@ -622,8 +813,22 @@ class Shell:
                 except OSError:
                     continue
                 mtime = time.strftime("%b %d %H:%M", time.localtime(st.st_mtime))
-                print(f"{stat.filemode(st.st_mode)} {st.st_nlink:>2} "
-                      f"{st.st_size:>8} {mtime} {self._styled_name(name, full)}")
+                cols = self.sec.ls_columns(full)
+                if cols:                      # mysh's own owner / group / mode
+                    mode, owner, group = cols
+                else:                         # outside the workspace: real values
+                    mode = stat.filemode(st.st_mode)
+                    try:
+                        owner = pwd.getpwuid(st.st_uid).pw_name
+                    except KeyError:
+                        owner = str(st.st_uid)
+                    group = "-"
+                print(f"{mode} {owner:<10}{group:<7}{st.st_size:>7} {mtime} "
+                      f"{self._styled_name(name, full)}")
+            return
+        if not sys.stdout.isatty():           # into a pipe: one name per line,
+            for name, full in entries:        # like the real ls, so grep and
+                print(name)                   # sort see one file per line
             return
         width = max(len(n) for n, _ in entries) + 2
         term_cols = shutil.get_terminal_size((80, 24)).columns
@@ -641,9 +846,18 @@ class Shell:
 
     def b_cat(self, args):
         if not args:
-            return self.err("cat: missing file operand")
+            if sys.stdin.isatty():
+                return self.err("cat: missing file operand")
+            data = sys.stdin.buffer.read()       # used inside a pipeline
+            sys.stdout.flush()
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+            return 0
         status = 0
         for name in args:
+            if os.path.isfile(name) and not self.sec.require("cat", name, "r"):
+                status = 1
+                continue
             try:
                 with open(name, "rb") as f:
                     data = f.read()
@@ -665,11 +879,22 @@ class Shell:
             return self.err("mkdir: missing operand")
         status = 0
         for name in names:
+            # the closest folder that already exists must be writable
+            new_dirs, probe = [], os.path.abspath(name)
+            while not os.path.exists(probe):
+                new_dirs.append(probe)
+                probe = os.path.dirname(probe)
+            if new_dirs and not self.sec.require("mkdir", probe, "w",
+                                                 target=os.path.relpath(probe) if probe != os.getcwd() else "."):
+                status = 1
+                continue
             try:
                 if parents:
                     os.makedirs(name, exist_ok=True)
                 else:
                     os.mkdir(name)
+                for d in reversed(new_dirs):
+                    self.sec.created(d, is_dir=True)
             except FileExistsError:
                 status = self.err(f"mkdir: cannot create directory '{name}': File exists")
             except FileNotFoundError:
@@ -678,13 +903,25 @@ class Shell:
                 status = self.err(f"mkdir: cannot create directory '{name}': Permission denied")
         return status
 
+    def _can_remove(self, cmd, name):
+        """Removing needs write access to the item and to its folder."""
+        if not self.sec.require(cmd, name, "w"):
+            return False
+        parent = self.sec.parent(name)
+        shown = os.path.relpath(parent) if parent != os.getcwd() else "."
+        return self.sec.require(cmd, parent, "w", target=shown)
+
     def b_rmdir(self, args):
         if not args:
             return self.err("rmdir: missing operand")
         status = 0
         for name in args:
+            if os.path.isdir(name) and not self._can_remove("rmdir", name):
+                status = 1
+                continue
             try:
                 os.rmdir(name)
+                self.sec.removed(name)
             except FileNotFoundError:
                 status = self.err(f"rmdir: failed to remove '{name}': No such file or directory")
             except NotADirectoryError:
@@ -713,6 +950,9 @@ class Shell:
             return self.err("rm: missing operand")
         status = 0
         for name in names:
+            if os.path.lexists(name) and not self._can_remove("rm", name):
+                status = 1
+                continue
             try:
                 if os.path.isdir(name) and not os.path.islink(name):
                     if not recursive:
@@ -721,6 +961,7 @@ class Shell:
                     shutil.rmtree(name)
                 else:
                     os.remove(name)
+                self.sec.removed(name)
             except FileNotFoundError:
                 if not force:
                     status = self.err(f"rm: cannot remove '{name}': No such file or directory")
@@ -733,11 +974,23 @@ class Shell:
             return self.err("touch: missing file operand")
         status = 0
         for name in args:
+            exists = os.path.exists(name)
+            if exists:
+                ok = self.sec.require("touch", name, "w")
+            else:
+                parent = self.sec.parent(name)
+                ok = not os.path.isdir(parent) or self.sec.require(
+                    "touch", parent, "w",
+                    target=os.path.relpath(parent) if parent != os.getcwd() else ".")
+            if not ok:
+                status = 1
+                continue
             try:
-                if os.path.exists(name):
+                if exists:
                     os.utime(name, None)     # update the timestamps
                 else:
                     open(name, "a").close()  # create an empty file
+                    self.sec.created(name)
             except FileNotFoundError:
                 status = self.err(f"touch: cannot touch '{name}': No such file or directory")
             except PermissionError:
