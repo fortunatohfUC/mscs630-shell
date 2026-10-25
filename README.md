@@ -1,4 +1,4 @@
-# mysh: Shell Simulation (Deliverables 1-2)
+# mysh: Shell Simulation (Deliverables 1-3)
 
 MSCS-630 Advanced Operating Systems, University of the Cumberlands
 
@@ -9,6 +9,9 @@ A Unix-like shell written in Python.
 - **Deliverable 2:** process scheduling with Round-Robin (configurable time slice)
   and preemptive Priority-Based scheduling, with waiting, turnaround and response
   time metrics.
+- **Deliverable 3:** memory management with paging (fixed-size frames, page
+  tables, page faults, FIFO and LRU replacement) and process synchronization
+  (mutex, counting semaphores, a race-condition demo and Producer-Consumer).
 
 ## Running
 
@@ -16,7 +19,7 @@ A Unix-like shell written in Python.
 python3 mysh.py
 ```
 
-Keep `mysh.py` and `scheduler.py` in the same folder. Requires Python 3.8+ on Linux or macOS (`os.fork()` is not available on Windows).
+Keep `mysh.py`, `scheduler.py`, `memory.py` and `sync.py` in the same folder. Requires Python 3.8+ on Linux or macOS (`os.fork()` is not available on Windows).
 No third-party packages are needed.
 
 ## Deliverable 1 features
@@ -48,6 +51,8 @@ No third-party packages are needed.
 | `bg [%job]` | Resume a stopped job in the background |
 | `trace on\|off` | Show process-management events |
 | `sched ...` | Process scheduling (see below) |
+| `mem ...` | Paging and page replacement (see below) |
+| `sync ...` | Mutex, semaphores, Producer-Consumer (see below) |
 | `help` | List commands |
 | `exit [n]` | Leave the shell |
 | `command &` | Run any program in the background |
@@ -99,4 +104,51 @@ sched demo
 sched rr 2
 sched priority
 sched compare
+```
+
+## Deliverable 3: memory management
+
+Physical memory is a fixed number of 4 KB page frames. Each process gets a page
+table, and pages are loaded on demand: touching a page that is not in memory is
+a page fault. When every frame is in use, the replacement policy picks a victim
+(global replacement, any process).
+
+- **FIFO:** evict the page that was loaded first.
+- **LRU:** evict the page that has gone the longest without being used.
+
+| Command | Description |
+|---|---|
+| `mem init FRAMES [fifo\|lru]` | Reset memory with FRAMES frames |
+| `mem policy fifo\|lru` | Choose the replacement algorithm |
+| `mem alloc NAME PAGES` | Give a process PAGES virtual pages |
+| `mem access NAME PAGE [PAGE ...]` | Touch pages (faults load them) |
+| `mem free NAME` | Deallocate a process and free its frames |
+| `mem status` | Frames, page tables, memory usage and fault counts |
+| `mem demo [fifo\|lru]` | 3 processes, 4 frames, one fixed access trace |
+| `mem refs [-f N] [fifo\|lru] [R ...]` | Run a page-reference string step by step |
+| `mem compare [R ...]` | FIFO vs LRU page faults for 3, 4 and 5 frames |
+
+## Deliverable 3: process synchronization
+
+Worker threads share memory, so they can race on shared data the same way
+processes race on shared memory or a file.
+
+- **Mutex:** one owner at a time; remembers the owner.
+- **Semaphore:** counting semaphore built on a condition variable (`wait` / `signal`).
+- **Producer-Consumer:** bounded buffer protected by `empty` and `full`
+  semaphores plus a mutex; the run ends with checks that every item was produced
+  and consumed exactly once and the buffer never overflowed.
+
+| Command | Description |
+|---|---|
+| `sync race [N]` | Shared counter without and with a mutex |
+| `sync pc [BUF] [PROD] [CONS] [ITEMS]` | Producer-Consumer (defaults 3 2 2 4) |
+| `sync speed SECONDS` | Pause between steps (default 0.15) |
+
+```
+mem demo fifo
+mem demo lru
+mem compare
+sync race
+sync pc
 ```

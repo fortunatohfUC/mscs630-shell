@@ -3,6 +3,8 @@
 mysh - Shell Simulation with Integrated OS Concepts
 Deliverable 1: Basic Shell Implementation and Process Management
 Deliverable 2: Process Scheduling (see scheduler.py and the `sched` built-in)
+Deliverable 3: Memory Management and Process Synchronization
+               (see memory.py / `mem` and sync.py / `sync`)
 
 MSCS-630 Advanced Operating Systems
 
@@ -17,6 +19,10 @@ What this deliverable covers
   * Deliverable 2: a `sched` built-in that runs a simulated workload through
     Round-Robin (configurable time slice) and preemptive Priority scheduling
     and reports waiting, turnaround and response time.
+  * Deliverable 3: a `mem` built-in that simulates paging with fixed-size
+    frames, page faults and FIFO / LRU replacement, and a `sync` built-in
+    with a mutex, counting semaphores, a race-condition demo and the
+    Producer-Consumer problem.
 
 Run it with:   python3 mysh.py
 It needs a Unix-like OS (Linux or macOS) because os.fork() does not exist
@@ -32,6 +38,8 @@ import sys
 import time
 
 from scheduler import SchedShell
+from memory import MemShell
+from sync import SyncShell
 
 try:
     import readline  # noqa: F401  arrow-key history and line editing
@@ -117,9 +125,11 @@ class Shell:
             "rm": self.b_rm, "touch": self.b_touch, "kill": self.b_kill,
             "jobs": self.b_jobs, "fg": self.b_fg, "bg": self.b_bg,
             "help": self.b_help, "trace": self.b_trace,
-            "sched": self.b_sched,
+            "sched": self.b_sched, "mem": self.b_mem, "sync": self.b_sync,
         }
         self.sched = SchedShell(self.err)   # Deliverable 2 scheduler
+        self.mem = MemShell(self.err)       # Deliverable 3 paging
+        self.sync = SyncShell(self.err)     # Deliverable 3 synchronization
 
         if self.interactive:
             self._init_job_control()
@@ -170,7 +180,7 @@ class Shell:
 
     # ------------------------------------------------------------- main loop
     def run(self):
-        print(color("mysh - MSCS-630 shell simulation (Deliverables 1-2). "
+        print(color("mysh - MSCS-630 shell simulation (Deliverables 1-3). "
                     "Type 'help' for commands.", CYAN))
         while True:
             self.reap_jobs()
@@ -475,6 +485,8 @@ class Shell:
             ("bg [%job]", "resume a stopped job in the background"),
             ("trace on|off", "show fork/exec/wait events as they happen"),
             ("sched help", "process scheduling (Round-Robin, Priority)"),
+            ("mem help", "paging, page faults, FIFO / LRU replacement"),
+            ("sync help", "mutex, semaphores, Producer-Consumer"),
             ("exit [n]", "leave the shell"),
             ("cmd &", "run any command in the background"),
         ]
@@ -485,6 +497,14 @@ class Shell:
     def b_sched(self, args):
         """Deliverable 2: simulated process scheduling."""
         return self.sched.run(args)
+
+    def b_mem(self, args):
+        """Deliverable 3: simulated paging and page replacement."""
+        return self.mem.run(args)
+
+    def b_sync(self, args):
+        """Deliverable 3: mutexes, semaphores and Producer-Consumer."""
+        return self.sync.run(args)
 
     def b_trace(self, args):
         if args and args[0] in ("on", "off"):
